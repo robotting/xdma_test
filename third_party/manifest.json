@@ -1,0 +1,6 @@
+﻿{
+  "dependencies": [
+    { "name": "glfw", "version": "3.4", "path": "third_party/glfw" },
+    { "name": "imgui", "version": "docking", "path": "third_party/imgui" }
+  ]
+}
