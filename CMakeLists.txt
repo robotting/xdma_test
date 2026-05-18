@@ -30,11 +30,23 @@ set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 
-# Linux：仅用 X11，不启用 Wayland（否则需要 wayland-scanner、libwayland-dev 等）
-# 若需 Wayland：安装上述包后改为 GLFW_BUILD_WAYLAND=ON，并删除 build 目录重新 cmake
+# Linux 显示后端（Wayland 开发环境默认 Wayland；可 -DXDMA_LINUX_X11=ON 切回纯 X11）
 if(UNIX AND NOT APPLE)
-    set(GLFW_BUILD_WAYLAND OFF CACHE BOOL "" FORCE)
-    set(GLFW_BUILD_X11 ON CACHE BOOL "" FORCE)
+    option(XDMA_LINUX_X11 "Linux: GLFW 使用 X11（关闭则用 Wayland）" OFF)
+    if(XDMA_LINUX_X11)
+        set(GLFW_BUILD_WAYLAND OFF CACHE BOOL "" FORCE)
+        set(GLFW_BUILD_X11 ON CACHE BOOL "" FORCE)
+    else()
+        find_program(WAYLAND_SCANNER_EXECUTABLE NAMES wayland-scanner)
+        if(NOT WAYLAND_SCANNER_EXECUTABLE)
+            message(FATAL_ERROR
+                "未找到 wayland-scanner。Wayland 构建请安装开发包后重试：\n"
+                "  sudo apt install libwayland-dev libxkbcommon-dev libegl1-mesa-dev \\\n"
+                "    libgl1-mesa-dev pkg-config")
+        endif()
+        set(GLFW_BUILD_WAYLAND ON CACHE BOOL "" FORCE)
+        set(GLFW_BUILD_X11 OFF CACHE BOOL "" FORCE)
+    endif()
 endif()
 
 add_subdirectory("${GLFW_DIR}" "${CMAKE_BINARY_DIR}/glfw" EXCLUDE_FROM_ALL)
@@ -66,10 +78,10 @@ if(WIN32)
     target_link_libraries(xdma_test PRIVATE setupapi)
 endif()
 
-# Linux：GLFW 在 X11 下需要 X11 及常见扩展库
+# Linux：Wayland 由 GLFW 经 pkg-config 自行链接；纯 X11 模式可显式链接 X11
 if(UNIX AND NOT APPLE)
-    find_package(X11)
-    if(X11_FOUND)
+    if(XDMA_LINUX_X11)
+        find_package(X11 REQUIRED)
         target_link_libraries(xdma_test PRIVATE X11::X11)
     endif()
     target_link_libraries(xdma_test PRIVATE dl m)
