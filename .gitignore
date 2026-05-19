@@ -1,5 +1,8 @@
 build/
 out/
+driver/windows/build/
+driver/dma_ip_drivers/**/Module.symvers
+driver/dma_ip_drivers/**/*.ko
 .vs/
 .vscode/
 CMakeCache.txt

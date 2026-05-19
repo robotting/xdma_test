@@ -1,0 +1,11 @@
+XDMA user-mode library (libxdma):
+  lib/xdma/include/xdma/xdma_device.h   public API
+  lib/xdma/src/xdma_device.cpp           implementation
+  cmake/xdma_lib.cmake                   CMake target: xdma (STATIC)
+
+GUI test application:
+  src/main.cpp                           links xdma + imgui_app
+
+Kernel drivers:
+  driver/windows/                        Windows KMDF (MSBuild)
+  driver/dma_ip_drivers/XDMA/linux-kernel/  Linux kernel module

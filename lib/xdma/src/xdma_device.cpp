@@ -1,4 +1,12 @@
-#include "xdma_device.h"
+/**
+ * @file xdma_device.cpp
+ * @brief Device 类实现：枚举、通道路径、句柄管理与 DMA/BAR 传输
+ *
+ * Windows：CreateFile + ReadFile/WriteFile + SetFilePointerEx
+ * Linux：open + read/write + lseek
+ */
+
+#include <xdma/xdma_device.h>
 
 #include <algorithm>
 #include <cstring>
@@ -6,7 +14,6 @@
 
 #ifdef _WIN32
 #include <setupapi.h>
-#pragma comment(lib, "setupapi.lib")
 #else
 #include <dirent.h>
 #include <errno.h>
@@ -18,17 +25,21 @@ namespace xdma {
 
 namespace {
 
+/** @return 通道类型对应的设备节点后缀名 */
 const char* suffix(ChannelKind k) {
     switch (k) {
         case ChannelKind::H2C: return "h2c";
         case ChannelKind::C2H: return "c2h";
         case ChannelKind::User: return "user";
         case ChannelKind::Bypass: return "bypass";
+        case ChannelKind::Control: return "control";
     }
     return "";
 }
 
 #ifdef _WIN32
+
+/** 宽字符转 UTF-8（SetupAPI 返回的设备实例 ID） */
 std::string wide_to_utf8(const wchar_t* w) {
     if (!w || !*w) return {};
     int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
@@ -38,6 +49,7 @@ std::string wide_to_utf8(const wchar_t* w) {
     return s;
 }
 
+/** UTF-8 转宽字符（CreateFileW 路径） */
 std::wstring utf8_to_wide(const std::string& s) {
     if (s.empty()) return {};
     int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
@@ -47,6 +59,7 @@ std::wstring utf8_to_wide(const std::string& s) {
     return w;
 }
 
+/** 设置 last_error_，并附加 GetLastError() 码 */
 void set_error(std::string& err, const std::string& msg) {
     err = msg;
     DWORD code = GetLastError();
@@ -57,6 +70,8 @@ void set_error(std::string& err, const std::string& msg) {
     }
 }
 #else
+
+/** 设置 last_error_，并附加 errno 描述 */
 void set_error(std::string& err, const std::string& msg) {
     if (errno != 0)
         err = msg + " (" + std::string(std::strerror(errno)) + ")";
@@ -64,10 +79,15 @@ void set_error(std::string& err, const std::string& msg) {
         err = msg;
 }
 
+/** Linux：检查 /dev 节点是否存在 */
 bool path_exists(const std::string& path) { return access(path.c_str(), F_OK) == 0; }
 #endif
 
 }  // namespace
+
+// =============================================================================
+// 构造 / 析构 / 移动
+// =============================================================================
 
 Device::~Device() { close(); }
 
@@ -82,18 +102,25 @@ Device& Device::operator=(Device&& other) noexcept {
         std::memcpy(c2h_, other.c2h_, sizeof(c2h_));
         user_ = other.user_;
         bypass_ = other.bypass_;
+        control_ = other.control_;
         std::memset(other.h2c_, 0, sizeof(other.h2c_));
         std::memset(other.c2h_, 0, sizeof(other.c2h_));
         other.user_ = kInvalid;
         other.bypass_ = kInvalid;
+        other.control_ = kInvalid;
     }
     return *this;
 }
+
+// =============================================================================
+// 设备枚举
+// =============================================================================
 
 std::vector<DeviceInfo> Device::enumerate() {
     std::vector<DeviceInfo> list;
 
 #ifdef _WIN32
+    // 枚举 PCI 类设备，筛选实例 ID 含 XDMA/xdma 的条目
     HDEVINFO dev_info =
         SetupDiGetClassDevsW(nullptr, L"PCI", nullptr, DIGCF_PRESENT | DIGCF_ALLCLASSES);
     if (dev_info != INVALID_HANDLE_VALUE) {
@@ -118,19 +145,14 @@ std::vector<DeviceInfo> Device::enumerate() {
     }
 #endif
 
+    // 若 SetupAPI 无结果，回退探测 \\.\xdmaN_user 是否存在
     auto probe = [&](int n) {
         std::ostringstream oss;
         oss << "xdma" << n;
         const std::string id = oss.str();
-        Device temp;
-        temp.device_id_ = id;
-        const std::string user_path = temp.make_path(ChannelKind::User, 0);
+        const std::string user_path = path_for(id, ChannelKind::User, 0);
 #ifdef _WIN32
-        const std::wstring wpath = utf8_to_wide("\\\\.\\" + id + "_user");
-        HANDLE h = CreateFileW(wpath.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
-                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (h != INVALID_HANDLE_VALUE) {
-            CloseHandle(h);
+        if (probe_path(user_path)) {
             DeviceInfo info;
             info.id = id;
             info.index = n;
@@ -151,7 +173,7 @@ std::vector<DeviceInfo> Device::enumerate() {
     }
 
 #ifndef _WIN32
-    // Scan /dev for xdma*_user nodes (covers non-standard naming)
+    // 扫描 /dev/xdma*_user 补充设备列表
     DIR* dir = opendir("/dev");
     if (dir) {
         struct dirent* ent;
@@ -176,6 +198,10 @@ std::vector<DeviceInfo> Device::enumerate() {
     return list;
 }
 
+// =============================================================================
+// 逻辑设备 open/close
+// =============================================================================
+
 bool Device::open(const std::string& device_id) {
     close();
     device_id_ = device_id;
@@ -190,23 +216,119 @@ void Device::close() {
     }
     close_channel(ChannelKind::User, 0);
     close_channel(ChannelKind::Bypass, 0);
+    close_channel(ChannelKind::Control, 0);
     device_id_.clear();
 }
 
 bool Device::is_open() const { return !device_id_.empty(); }
 
-std::string Device::make_path(ChannelKind kind, int channel) const {
+// =============================================================================
+// 路径构造与探测
+// =============================================================================
+
+std::string Device::path_for(const std::string& device_id, ChannelKind kind, int channel) {
     std::ostringstream oss;
 #ifdef _WIN32
-    oss << "\\\\.\\" << device_id_;
+    oss << "\\\\.\\" << device_id;
 #else
-    oss << "/dev/" << device_id_;
+    oss << "/dev/" << device_id;
 #endif
-    if (kind != ChannelKind::User && kind != ChannelKind::Bypass)
+    if (kind != ChannelKind::User && kind != ChannelKind::Bypass &&
+        kind != ChannelKind::Control)
         oss << "_" << suffix(kind) << "_" << channel;
     else
         oss << "_" << suffix(kind);
     return oss.str();
+}
+
+bool Device::probe_path(const std::string& path) {
+#ifdef _WIN32
+    // 尝试只读或只写打开以判断节点是否存在
+    const std::wstring wpath = utf8_to_wide(path);
+    HANDLE h = CreateFileW(wpath.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        h = CreateFileW(wpath.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
+                       FILE_ATTRIBUTE_NORMAL, nullptr);
+    }
+    if (h == INVALID_HANDLE_VALUE) return false;
+    CloseHandle(h);
+    return true;
+#else
+    return access(path.c_str(), F_OK) == 0;
+#endif
+}
+
+std::vector<ChannelDesc> Device::list_channels() const {
+    std::vector<ChannelDesc> out;
+    if (device_id_.empty()) return out;
+
+    auto add = [&](ChannelKind kind, int ch, const char* label) {
+        ChannelDesc d;
+        d.kind = kind;
+        d.channel = ch;
+        d.name = label;
+        d.path = path_for(device_id_, kind, ch);
+        d.presence = probe_path(d.path) ? ChannelPresence::Present : ChannelPresence::Absent;
+        d.is_open = is_channel_open(kind, ch);
+        out.push_back(std::move(d));
+    };
+
+    for (int i = 0; i < 4; ++i) {
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "h2c_%d", i);
+        add(ChannelKind::H2C, i, buf);
+    }
+    for (int i = 0; i < 4; ++i) {
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "c2h_%d", i);
+        add(ChannelKind::C2H, i, buf);
+    }
+    add(ChannelKind::User, 0, "user");
+    add(ChannelKind::Bypass, 0, "bypass");
+    add(ChannelKind::Control, 0, "control");
+    return out;
+}
+
+// =============================================================================
+// 通道批量管理
+// =============================================================================
+
+void Device::close_all_channels() {
+    for (int i = 0; i < 4; ++i) {
+        close_channel(ChannelKind::H2C, i);
+        close_channel(ChannelKind::C2H, i);
+    }
+    close_channel(ChannelKind::User, 0);
+    close_channel(ChannelKind::Bypass, 0);
+    close_channel(ChannelKind::Control, 0);
+}
+
+int Device::open_all_present_channels() {
+    int n = 0;
+    for (const auto& ch : list_channels()) {
+        if (ch.presence != ChannelPresence::Present || ch.is_open) continue;
+        if (open_channel(ch.kind, ch.channel)) ++n;
+    }
+    return n;
+}
+
+int Device::close_all_open_channels() {
+    int n = 0;
+    for (const auto& ch : list_channels()) {
+        if (!ch.is_open) continue;
+        close_channel(ch.kind, ch.channel);
+        ++n;
+    }
+    return n;
+}
+
+// =============================================================================
+// 单通道 open/close
+// =============================================================================
+
+std::string Device::make_path(ChannelKind kind, int channel) const {
+    return path_for(device_id_, kind, channel);
 }
 
 Device::Handle Device::channel_handle(ChannelKind kind, int channel) const {
@@ -219,6 +341,7 @@ Device::Handle Device::channel_handle(ChannelKind kind, int channel) const {
             break;
         case ChannelKind::User: return user_;
         case ChannelKind::Bypass: return bypass_;
+        case ChannelKind::Control: return control_;
     }
     return kInvalid;
 }
@@ -233,6 +356,7 @@ bool Device::open_channel(ChannelKind kind, int channel) {
     const std::string path = make_path(kind, channel);
 
 #ifdef _WIN32
+    // H2C 仅写、C2H 仅读，与官方示例一致
     const std::wstring wpath = utf8_to_wide(path);
     DWORD access = GENERIC_READ | GENERIC_WRITE;
     if (kind == ChannelKind::H2C) access = GENERIC_WRITE;
@@ -250,6 +374,7 @@ bool Device::open_channel(ChannelKind kind, int channel) {
         case ChannelKind::C2H: c2h_[channel] = h; break;
         case ChannelKind::User: user_ = h; break;
         case ChannelKind::Bypass: bypass_ = h; break;
+        case ChannelKind::Control: control_ = h; break;
     }
     return true;
 #else
@@ -258,10 +383,7 @@ bool Device::open_channel(ChannelKind kind, int channel) {
     if (kind == ChannelKind::C2H) flags = O_RDONLY;
 
     int fd = open(path.c_str(), flags);
-    if (fd < 0) {
-        // Some kernels expose channels as read-write only
-        fd = open(path.c_str(), O_RDWR);
-    }
+    if (fd < 0) fd = open(path.c_str(), O_RDWR);
     if (fd < 0) {
         set_error(last_error_, "open failed: " + path);
         return false;
@@ -272,6 +394,7 @@ bool Device::open_channel(ChannelKind kind, int channel) {
         case ChannelKind::C2H: c2h_[channel] = fd; break;
         case ChannelKind::User: user_ = fd; break;
         case ChannelKind::Bypass: bypass_ = fd; break;
+        case ChannelKind::Control: control_ = fd; break;
     }
     return true;
 #endif
@@ -288,6 +411,7 @@ void Device::close_channel(ChannelKind kind, int channel) {
             break;
         case ChannelKind::User: target = &user_; break;
         case ChannelKind::Bypass: target = &bypass_; break;
+        case ChannelKind::Control: target = &control_; break;
     }
     if (!target || *target == kInvalid) return;
 
@@ -302,6 +426,10 @@ void Device::close_channel(ChannelKind kind, int channel) {
 bool Device::is_channel_open(ChannelKind kind, int channel) const {
     return channel_handle(kind, channel) != kInvalid;
 }
+
+// =============================================================================
+// 底层传输与各通道读写封装
+// =============================================================================
 
 bool Device::transfer(Handle h, uint64_t offset, void* buf, size_t size, bool write,
                       size_t* out_bytes) {
@@ -338,6 +466,7 @@ bool Device::transfer(Handle h, uint64_t offset, void* buf, size_t size, bool wr
         return false;
     }
 
+    // Linux 可能短读/短写，循环直至凑满 size
     size_t total = 0;
     auto* ptr = static_cast<uint8_t*>(buf);
     while (total < size) {
@@ -373,6 +502,23 @@ bool Device::write_user(uint64_t offset, const void* data, size_t size, size_t* 
 
 bool Device::read_user(uint64_t offset, void* data, size_t size, size_t* out_bytes) {
     return transfer(user_, offset, data, size, false, out_bytes);
+}
+
+bool Device::write_control(uint64_t offset, const void* data, size_t size, size_t* out_bytes) {
+    return transfer(control_, offset, const_cast<void*>(data), size, true, out_bytes);
+}
+
+bool Device::read_control(uint64_t offset, void* data, size_t size, size_t* out_bytes) {
+    return transfer(control_, offset, data, size, false, out_bytes);
+}
+
+bool Device::is_axi_streaming(bool* out) {
+    // 第一个模块 ID 寄存器 bit15：1=AXI-ST，0=AXI-MM（PG195 / xdma_test）
+    uint32_t reg = 0;
+    if (!read_control(0, &reg, sizeof(reg))) return false;
+    const bool st = (reg & (1u << 15)) != 0;
+    if (out) *out = st;
+    return true;
 }
 
 }  // namespace xdma
